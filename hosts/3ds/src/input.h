@@ -30,5 +30,9 @@ bool input_devmenu_blocks_guest(bool menu_visible);
 size_t input_touch(uint32_t *packed);
 
 bool input_offload_exit_requested(void);
+/** Request a screenshot save to SD. Can be called from JS HostTakeScreenshot or native code. */
+void input_request_screenshot(void);
+/** Check if a screenshot was requested (by button chord START+SELECT / L+R+Y or JS). */
+bool input_screenshot_requested(void);
 
 #endif

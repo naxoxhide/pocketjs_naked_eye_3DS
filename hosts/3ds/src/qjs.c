@@ -30,6 +30,7 @@
 #include "pocket_core.h"
 #include "quickjs.h"
 #include "svcwire.h"
+#include "input.h"
 
 #ifndef POCKETJS_TARGET_ID
 #error "POCKETJS_TARGET_ID must come from the verified ResolvedBuildPlan"
@@ -100,6 +101,7 @@ typedef enum {
   HostPhysicsDestroy,
   HostPhysicsEvents,
   HostPhysicsQuery,
+  HostTakeScreenshot,
 } HostOperation;
 
 static JSRuntime *runtime;
@@ -599,6 +601,10 @@ static JSValue host_operation(
         JS_FreeCString(ctx, text);
       }
       return JS_UNDEFINED;
+    case HostTakeScreenshot:
+      /* Triggers an asynchronous full-screen capture to sdmc:/screenshots/ (Native.takeScreenshot). */
+      input_request_screenshot();
+      return JS_TRUE;
   }
   return JS_UNDEFINED;
 }
@@ -789,8 +795,15 @@ static void install_host(void) {
   }
   JS_SetPropertyStr(context, ui, "__sprites", sprites);
 
+  /* SD card screenshot capture */
+  add_operation(ui, "takeScreenshot", 0, HostTakeScreenshot);
+
   /* JS_SetPropertyStr consumes ownership of `ui`. */
   JS_SetPropertyStr(context, global, "ui", ui);
+
+  JSValue native = JS_NewObject(context);
+  add_operation(native, "takeScreenshot", 0, HostTakeScreenshot);
+  JS_SetPropertyStr(context, global, "Native", native);
 }
 
 static bool drain_jobs(void) {

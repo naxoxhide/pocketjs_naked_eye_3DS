@@ -37,9 +37,12 @@
 #define RUNTIME_RELOAD_KEYS (KEY_L | KEY_R | KEY_X)
 #define RUNTIME_DEVMENU_KEYS (KEY_L | KEY_R | KEY_SELECT)
 #define RUNTIME_EXIT_KEYS (KEY_L | KEY_R | KEY_START)
+#define RUNTIME_SCREENSHOT_KEYS (KEY_START | KEY_SELECT)
+#define RUNTIME_SCREENSHOT_KEYS_ALT (KEY_L | KEY_R | KEY_Y)
 
 static bool devmenu_input_latched;
 static bool extra_input;
+static bool screenshot_requested_flag;
 
 void input_init(void) {
 #ifndef POCKETJS_CAPTURE
@@ -86,6 +89,12 @@ int32_t input_buttons(void) {
   }
   if ((held & RUNTIME_EXIT_KEYS) == RUNTIME_EXIT_KEYS) {
     held &= ~RUNTIME_EXIT_KEYS;
+  }
+  if ((held & RUNTIME_SCREENSHOT_KEYS) == RUNTIME_SCREENSHOT_KEYS) {
+    held &= ~RUNTIME_SCREENSHOT_KEYS;
+  }
+  if ((held & RUNTIME_SCREENSHOT_KEYS_ALT) == RUNTIME_SCREENSHOT_KEYS_ALT) {
+    held &= ~RUNTIME_SCREENSHOT_KEYS_ALT;
   }
   int32_t buttons = 0;
   for (size_t index = 0; index < sizeof KEY_MAP / sizeof KEY_MAP[0]; index += 1) {
@@ -168,4 +177,27 @@ size_t input_touch(uint32_t *packed) {
 bool input_offload_exit_requested(void) {
   const uint32_t keys = KEY_L | KEY_R | KEY_START;
   return (hidKeysHeld() & keys) == keys;
+}
+
+/* Requests a screenshot capture on the next frame (triggered via JS HostTakeScreenshot). */
+void input_request_screenshot(void) {
+  screenshot_requested_flag = true;
+}
+
+/*
+ * Checks if a screenshot was triggered, either via hardware chord
+ * (START+SELECT or L+R+Y) or programmatically via input_request_screenshot().
+ */
+bool input_screenshot_requested(void) {
+  if (screenshot_requested_flag) {
+    screenshot_requested_flag = false;
+    return true;
+  }
+  uint32_t held = hidKeysHeld();
+  uint32_t down = hidKeysDown();
+  bool primary = ((held & RUNTIME_SCREENSHOT_KEYS) == RUNTIME_SCREENSHOT_KEYS &&
+                  (down & RUNTIME_SCREENSHOT_KEYS) != 0);
+  bool alt = ((held & RUNTIME_SCREENSHOT_KEYS_ALT) == RUNTIME_SCREENSHOT_KEYS_ALT &&
+              (down & RUNTIME_SCREENSHOT_KEYS_ALT) != 0);
+  return primary || alt;
 }

@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #include "gfx.h"
 #include "input.h"
@@ -108,6 +109,173 @@ static void read_surface_rgb8(
       GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO)
   );
   GSPGPU_InvalidateDataCache(out, (s32)((size_t)width * height * 3));
+}
+
+#pragma pack(push, 1)
+typedef struct {
+  uint16_t bfType;
+  uint32_t bfSize;
+  uint16_t bfReserved1;
+  uint16_t bfReserved2;
+  uint32_t bfOffBits;
+  uint32_t biSize;
+  int32_t  biWidth;
+  int32_t  biHeight;
+  uint16_t biPlanes;
+  uint16_t biBitCount;
+  uint32_t biCompression;
+  uint32_t biSizeImage;
+  int32_t  biXPelsPerMeter;
+  int32_t  biYPelsPerMeter;
+  uint32_t biClrUsed;
+  uint32_t biClrImportant;
+} BmpHeader;
+#pragma pack(pop)
+
+_Static_assert(sizeof(BmpHeader) == 54, "BmpHeader must be 54 bytes");
+
+/*
+ * Exports linear framebuffer bytes as a 24-bit uncompressed BGR888 BMP file.
+ * Handles 3DS panel coordinate transposition from portrait column-major
+ * hardware storage (240x400) to standard landscape row-major (400x240) in
+ * bottom-up order required by the BMP standard.
+ */
+static bool write_bmp_surface(const char *path, const uint8_t *src_linear, uint32_t width, uint32_t height) {
+  FILE *file = fopen(path, "wb");
+  if (file == NULL) return false;
+
+  char *vbuf = (char *)malloc(32768);
+  if (vbuf != NULL) {
+    setvbuf(file, vbuf, _IOFBF, 32768);
+  }
+
+  uint32_t row_bytes = width * 3;
+  uint32_t image_size = row_bytes * height;
+
+  BmpHeader header;
+  memset(&header, 0, sizeof(header));
+  header.bfType = 0x4D42; /* 'BM' */
+  header.bfSize = (uint32_t)(sizeof(BmpHeader) + image_size);
+  header.bfOffBits = (uint32_t)sizeof(BmpHeader);
+  header.biSize = 40;
+  header.biWidth = (int32_t)width;
+  header.biHeight = (int32_t)height; /* positive = bottom-up */
+  header.biPlanes = 1;
+  header.biBitCount = 24;
+  header.biCompression = 0; /* BI_RGB */
+  header.biSizeImage = image_size;
+
+  if (fwrite(&header, 1, sizeof(header), file) != sizeof(header)) {
+    fclose(file);
+    if (vbuf != NULL) free(vbuf);
+    return false;
+  }
+
+  /* BMP with positive biHeight is bottom-up:
+   * Row r = 0 is visual y = height - 1.
+   * Row r = height - 1 is visual y = 0.
+   *
+   * The 3DS screen stores columns vertically:
+   * Landscape pixel (x, y) is at offset src[(x * height + (height - 1 - y)) * 3].
+   * Substituting visual y = height - 1 - r:
+   * src_index = (x * height + r) * 3.
+   * The color format from read_surface_rgb8 is BGR, matching BMP 24-bit directly. */
+  uint8_t row[1200];
+  for (uint32_t r = 0; r < height; ++r) {
+    for (uint32_t x = 0; x < width; ++x) {
+      uint32_t src_idx = (x * height + r) * 3;
+      uint32_t dst_idx = x * 3;
+      row[dst_idx + 0] = src_linear[src_idx + 0];
+      row[dst_idx + 1] = src_linear[src_idx + 1];
+      row[dst_idx + 2] = src_linear[src_idx + 2];
+    }
+    if (fwrite(row, 1, row_bytes, file) != row_bytes) {
+      fclose(file);
+      if (vbuf != NULL) free(vbuf);
+      return false;
+    }
+  }
+
+  bool ok = (fclose(file) == 0);
+  if (vbuf != NULL) free(vbuf);
+  return ok;
+}
+
+/*
+ * Captures all active render targets (Top Left eye, Top Right eye, and Bottom
+ * screen) and saves them directly to SD card (sdmc:/screenshots/) with timestamp.
+ */
+static bool capture_screenshot_sd(
+  C3D_RenderTarget *top_left,
+  C3D_RenderTarget *top_right,
+  C3D_RenderTarget *bottom
+) {
+  mkdir("sdmc:/screenshots", 0777);
+
+  uint8_t *linear_buf = linearAlloc(VIEW_W * VIEW_H * 3);
+  if (linear_buf == NULL) {
+    devserver_report_log("error", "screenshot: linear buffer allocation failed");
+    return false;
+  }
+
+  gspWaitForVBlank();
+
+  uint64_t now_ms = osGetTime();
+  time_t now_sec = (time_t)(now_ms / 1000);
+  struct tm *tm_info = localtime(&now_sec);
+
+  char ts[32];
+  if (tm_info != NULL) {
+    snprintf(ts, sizeof(ts), "%04d%02d%02d_%02d%02d%02d",
+             tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
+             tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
+  } else {
+    snprintf(ts, sizeof(ts), "%llu", (unsigned long long)now_ms);
+  }
+
+  char path_left[128];
+  char path_right[128];
+  char path_bot[128];
+
+  struct stat st;
+  snprintf(path_left, sizeof(path_left), "sdmc:/screenshots/screenshot_%s_top_left.bmp", ts);
+  if (stat(path_left, &st) == 0) {
+    for (int i = 1; i < 1000; i++) {
+      snprintf(path_left, sizeof(path_left), "sdmc:/screenshots/screenshot_%s_%d_top_left.bmp", ts, i);
+      if (stat(path_left, &st) != 0) {
+        snprintf(path_right, sizeof(path_right), "sdmc:/screenshots/screenshot_%s_%d_top_right.bmp", ts, i);
+        snprintf(path_bot, sizeof(path_bot), "sdmc:/screenshots/screenshot_%s_%d_bottom.bmp", ts, i);
+        break;
+      }
+    }
+  } else {
+    snprintf(path_right, sizeof(path_right), "sdmc:/screenshots/screenshot_%s_top_right.bmp", ts);
+    snprintf(path_bot, sizeof(path_bot), "sdmc:/screenshots/screenshot_%s_bottom.bmp", ts);
+  }
+
+  bool ok = true;
+
+  if (top_left != NULL) {
+    read_surface_rgb8(top_left, VIEW_W, VIEW_H, linear_buf);
+    ok &= write_bmp_surface(path_left, linear_buf, VIEW_W, VIEW_H);
+  }
+
+  if (top_right != NULL) {
+    read_surface_rgb8(top_right, VIEW_W, VIEW_H, linear_buf);
+    ok &= write_bmp_surface(path_right, linear_buf, VIEW_W, VIEW_H);
+  }
+
+  if (bottom != NULL) {
+    read_surface_rgb8(bottom, AUX_VIEW_W, AUX_VIEW_H, linear_buf);
+    ok &= write_bmp_surface(path_bot, linear_buf, AUX_VIEW_W, AUX_VIEW_H);
+  }
+
+  linearFree(linear_buf);
+
+  devserver_report_log("info", ok ? "screenshot: saved to sdmc:/screenshots/" : "screenshot: write failed");
+  devmenu_set_notice(ok ? "SCREENSHOT SAVED" : "SCREENSHOT FAILED");
+
+  return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -1047,6 +1215,10 @@ int main(void) {
       gfx_frame_vertices(),
       gfx_dropped_vertices()
     );
+    /* Save screenshots to SD card if requested via chord (START+SELECT, L+R+Y) or JS API. */
+    if (input_screenshot_requested()) {
+      capture_screenshot_sd(primary_target, NULL, auxiliary_target);
+    }
     if (devserver_take_screenshot_request()) {
       uint8_t *top_rgb = NULL;
       uint8_t *auxiliary_rgb = NULL;
